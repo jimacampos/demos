@@ -8,9 +8,22 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Azure.AI.Projects" Version="1.0.0-beta.2" />
-    <PackageReference Include="Azure.Identity" Version="1.15.0" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="9.0.8" />
+	  <PackageReference Include="Azure.AI.OpenAI" Version="2.3.0-beta.2" />
+	  <PackageReference Include="Azure.AI.Projects" Version="1.0.0-beta.11" />
+	  <PackageReference Include="Azure.Identity" Version="1.16.0" />
+	  <PackageReference Include="Microsoft.Extensions.Configuration" Version="8.0.0" />
+	  <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.1" />
+	  <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="8.0.0" />
+	  <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="data.txt">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

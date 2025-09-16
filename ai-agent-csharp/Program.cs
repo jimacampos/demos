@@ -1,157 +1,228 @@
-﻿using Azure.AI.Projects;
+﻿using Agent;
+using Azure;
+using Azure.AI.OpenAI;
+using Azure.AI.OpenAI.Chat;
 using Azure.Identity;
 using Microsoft.Extensions.Configuration;
+using OpenAI;
+using OpenAI.Assistants;
+using System;
+using System.ClientModel;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
 class Program
 {
     private static IConfiguration? _configuration;
-    
+
     static async Task Main(string[] args)
     {
+#pragma warning disable OPENAI001
         // Clear the console
         Console.Clear();
-        
-        // Load configuration from environment variables
-        _configuration = new ConfigurationBuilder()
-            .AddEnvironmentVariables()
+
+        // Load configuration from appsettings.json or environment variables
+        var configuration = new ConfigurationBuilder()
+            .SetBasePath(Directory.GetCurrentDirectory())
+            .AddJsonFile("appsettings.json")
             .Build();
-            
-        string? projectEndpoint = _configuration["PROJECT_ENDPOINT"];
-        string? modelDeploymentName = _configuration["MODEL_DEPLOYMENT_NAME"];
-        
-        if (string.IsNullOrEmpty(projectEndpoint))
-        {
-            Console.WriteLine("Please set PROJECT_ENDPOINT environment variable");
-            return;
-        }
-        
-        if (string.IsNullOrEmpty(modelDeploymentName))
-        {
-            modelDeploymentName = "gpt-4o";
-        }
-        
-        // Display the data to be analyzed
-        string dataFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data.txt");
-        
-        if (!File.Exists(dataFilePath))
-        {
-            Console.WriteLine($"Data file not found: {dataFilePath}");
-            return;
-        }
-        
-        string data = await File.ReadAllTextAsync(dataFilePath);
-        Console.WriteLine(data);
-        Console.WriteLine();
-        
-        // Connect to the Agent client
-        var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions
-        {
-            ExcludeEnvironmentCredential = true,
-            ExcludeManagedIdentityCredential = true
-        });
-        
-        var agentsClient = new AgentsClient(projectEndpoint, credential);
-        
+
+        var projectEndpoint = configuration["PROJECT_ENDPOINT"];
+        var modelDeployment = configuration["MODEL_DEPLOYMENT_NAME"];
+
+        // Create credentials (excluding environment and managed identity)
+        //var credential = new DefaultAzureCredential();
+
+        // Create Azure OpenAI client
+        var azureOpenAIClient = new AzureOpenAIClient(
+            new Uri(projectEndpoint),
+            new ApiKeyCredential("API_KEY")
+        );
+
+        // Get the Assistance client
+        var assistantClient = azureOpenAIClient.GetAssistantClient();
+
         try
         {
-            // Upload the data file
-            var uploadedFile = await agentsClient.UploadFileAsync(
-                filePath: dataFilePath,
-                purpose: AgentFilePurpose.Agents);
-            Console.WriteLine($"Uploaded {Path.GetFileName(dataFilePath)}");
-            
-            // Create a code interpreter tool definition
-            var codeInterpreterTool = new CodeInterpreterToolDefinition();
-            
-            // Create tool resources with the uploaded file
-            var toolResources = new ToolResources()
+            // Define the function tool
+            var submitTicketTool = new FunctionToolDefinition("submit_support_ticket");
+            submitTicketTool.Description = "Submit a support ticket with email and description";
+            submitTicketTool.Parameters = BinaryData.FromString("""
+                {
+                    "type": "object",
+                    "properties": {
+                        "email_address": {
+                            "type": "string",
+                            "description": "The email address of the user"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Description of the issue"
+                        }
+                    },
+                    "required": ["email_address", "description"]
+                }
+                """);
+
+            // Create the assistant with tools
+            var assistantOptions = new AssistantCreationOptions()
             {
-                CodeInterpreter = new CodeInterpreterToolResource()
+                Name = "support-agent",
+                Instructions = """
+                        You are a technical support agent.
+                        When a user has a technical issue, you get their email address and a description of the issue.
+                        Then you use those values to submit a support ticket using the function available to you.
+                        If a file is saved, tell the user the file name.
+                    """,
+                Tools = { submitTicketTool }
             };
-            toolResources.CodeInterpreter.FileIds.Add(uploadedFile.Value.Id);
-            
-            // Define an agent that uses the CodeInterpreterTool
-            var agent = await agentsClient.CreateAgentAsync(
-                model: modelDeploymentName,
-                name: "data-agent", 
-                description: "A helpful AI agent for data analysis",
-                instructions: "You are an AI agent that analyzes the data in the file that has been uploaded. Use Python to calculate statistical metrics as necessary.",
-                tools: new[] { codeInterpreterTool },
-                toolResources: toolResources);
-                
-            Console.WriteLine($"Using agent: {agent.Value.Name}");
-            Console.WriteLine();
-            
-            // Create a thread for the conversation
-            var thread = await agentsClient.CreateThreadAsync();
-            
-            // Loop until the user types 'quit'
+
+            var assistant = await assistantClient.CreateAssistantAsync(
+                model: modelDeployment,
+                assistantOptions
+            );
+
+            Console.WriteLine($"You're chatting with: {assistant.Value.Name} ({assistant.Value.Id})");
+
+            // Create a thread
+            var thread = await assistantClient.CreateThreadAsync();
+            var threadId = thread.Value.Id;
+
+            // Main interaction loop
             while (true)
             {
-                // Get input text
                 Console.Write("Enter a prompt (or type 'quit' to exit): ");
-                string? userPrompt = Console.ReadLine();
-                
-                if (string.IsNullOrEmpty(userPrompt) || userPrompt.ToLower() == "quit")
+                var userPrompt = Console.ReadLine();
+
+                if (string.IsNullOrEmpty(userPrompt))
+                {
+                    Console.WriteLine("Please enter a prompt.");
+                    continue;
+                }
+
+                if (userPrompt.Equals("quit", StringComparison.OrdinalIgnoreCase))
                 {
                     break;
                 }
-                
-                // Send a prompt to the agent
-                await agentsClient.CreateMessageAsync(
-                    threadId: thread.Value.Id,
-                    role: MessageRole.User,
-                    content: userPrompt);
-                
-                // Create a run and poll for completion
-                var run = await agentsClient.CreateRunAsync(thread.Value, agent.Value);
-                
-                // Poll for run completion
-                do
+
+                var messageContent = MessageContent.FromText(userPrompt);
+
+                await assistantClient.CreateMessageAsync(threadId, MessageRole.User, [messageContent]);
+
+                var run = await assistantClient.CreateRunAsync(threadId, assistant.Value.Id);
+                var runId = run.Value.Id;
+
+                // Wait for the run to complete
+                while (true)
                 {
                     await Task.Delay(1000);
-                    run = await agentsClient.GetRunAsync(thread.Value.Id, run.Value.Id);
-                } while (run.Value.Status == RunStatus.Queued || run.Value.Status == RunStatus.InProgress);
-                
-                // Check the run status for failures
+                    run = await assistantClient.GetRunAsync(threadId, runId);
+
+                    if (run.Value.Status == RunStatus.Completed)
+                    {
+                        break;
+                    }
+                    else if (run.Value.Status == RunStatus.Failed)
+                    {
+                        Console.WriteLine($"Run failed: {run.Value.LastError?.Message}");
+                        break;
+                    }
+                    else if (run.Value.Status == RunStatus.RequiresAction)
+                    {
+                        // Handle function calls
+                        var requiredActions = run.Value.RequiredActions;
+                        if (requiredActions is not null)
+                        {
+                            var toolOutputs = new List<ToolOutput>();
+
+                            foreach (var toolCall in requiredActions)
+                            {
+                                if (toolCall.FunctionName == "submit_support_ticket")
+                                {
+                                    try
+                                    {
+                                        var arguments = JsonSerializer.Deserialize<Dictionary<string, string>>(toolCall.FunctionArguments);
+                                        var result = UserFunctions.SubmitSupportTicket(
+                                            arguments["email_address"],
+                                            arguments["description"]
+                                        );
+
+                                        toolOutputs.Add(new ToolOutput(toolCall.ToolCallId, result));
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        toolOutputs.Add(new ToolOutput(toolCall.ToolCallId, $"Error: {ex.Message}"));
+                                    }
+                                }
+                            }
+
+                            if (toolOutputs.Any())
+                            {
+                                await assistantClient.SubmitToolOutputsToRunAsync(threadId, runId, toolOutputs);
+                            }
+                        }
+                    }
+                }
+
                 if (run.Value.Status == RunStatus.Failed)
                 {
-                    Console.WriteLine($"Run failed: {run.Value.LastError?.Message}");
                     continue;
                 }
-                
-                // Show the latest response from the agent
-                var messages = await agentsClient.GetMessagesAsync(thread.Value.Id);
-                var lastMessage = messages.Value.FirstOrDefault(m => m.Role == MessageRole.Agent);
-                
-                if (lastMessage?.ContentItems?.FirstOrDefault() is MessageTextContent textContent)
+
+                // Get the latest messages from the thread
+                var messages = assistantClient.GetMessagesAsync(threadId, new MessageCollectionOptions()
                 {
-                    Console.WriteLine($"Agent: {textContent.Text}");
-                    Console.WriteLine();
+                    Order = MessageCollectionOrder.Descending
+                });
+
+                // Get the latest assistant message
+                await foreach (var message in messages)
+                {
+                    if (message.Role == MessageRole.Assistant)
+                    {
+                        foreach (var content in message.Content)
+                        {
+                            if (content is MessageContent textContent)
+                            {
+                                Console.WriteLine($"Last Message: {textContent.Text}");
+                            }
+                        }
+                        break; // Only show the latest assistant message
+                    }
                 }
             }
-            
-            // Get the conversation history
+
+            // Display conversation history
             Console.WriteLine("\nConversation Log:\n");
-            var allMessages = await agentsClient.GetMessagesAsync(
-                threadId: thread.Value.Id, 
-                order: ListSortOrder.Ascending);
-            
-            foreach (var message in allMessages.Value)
+            var allMessages = assistantClient.GetMessagesAsync(threadId, new MessageCollectionOptions()
             {
-                var role = message.Role == MessageRole.User ? "User" : "Agent";
-                if (message.ContentItems?.FirstOrDefault() is MessageTextContent content)
+                Order = MessageCollectionOrder.Ascending
+            });
+
+            await foreach (var message in allMessages)
+            {
+                foreach (var content in message.Content)
                 {
-                    Console.WriteLine($"{role}: {content.Text}\n");
+                    if (content is MessageContent textContent)
+                    {
+                        Console.WriteLine($"{message.Role}: {textContent.Text}\n");
+                    }
                 }
             }
-            
+
             // Clean up
-            await agentsClient.DeleteAgentAsync(agent.Value.Id);
+            await assistantClient.DeleteAssistantAsync(assistant.Value.Id);
+            Console.WriteLine("Deleted agent");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"An error occurred: {ex.Message}");
+            Console.WriteLine($"Error: {ex.Message}");
+            Console.WriteLine($"Stack trace: {ex.StackTrace}");
         }
+#pragma warning restore OPENAI001
     }
 }
