@@ -1,25 +1,15 @@
 ﻿using Agent;
-using Azure;
 using Azure.AI.OpenAI;
-using Azure.AI.OpenAI.Chat;
-using Azure.Identity;
 using Microsoft.Extensions.Configuration;
-using OpenAI;
 using OpenAI.Assistants;
-using System;
 using System.ClientModel;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
 using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
 
 class Program
 {
     private static IConfiguration? _configuration;
 
-    static async Task Main(string[] args)
+    static async Task Main(string[] arguments)
     {
 #pragma warning disable OPENAI001
         // Clear the console
@@ -34,13 +24,10 @@ class Program
         var projectEndpoint = configuration["PROJECT_ENDPOINT"];
         var modelDeployment = configuration["MODEL_DEPLOYMENT_NAME"];
 
-        // Create credentials (excluding environment and managed identity)
-        //var credential = new DefaultAzureCredential();
-
         // Create Azure OpenAI client
         var azureOpenAIClient = new AzureOpenAIClient(
             new Uri(projectEndpoint),
-            new ApiKeyCredential("API_KEY")
+            new ApiKeyCredential("AZURE_AGENT_API_KEY")
         );
 
         // Get the Assistance client
@@ -68,18 +55,79 @@ class Program
                 }
                 """);
 
+            var checkStatusTool = new FunctionToolDefinition("check_ticket_status")
+            {
+                Description = "Get the current status for a given ticket",
+                Parameters = BinaryData.FromString("{\"type\":\"object\",\"properties\":{\"ticket_id\":{\"type\":\"string\"}},\"required\":[\"ticket_id\"]}")
+            };
+
+            var addCommentTool = new FunctionToolDefinition("add_ticket_comment")
+            {
+                Description = "Add a comment to a ticket",
+                Parameters = BinaryData.FromString("{\"type\":\"object\",\"properties\":{\"ticket_id\":{\"type\":\"string\"},\"comment\":{\"type\":\"string\"}},\"required\":[\"ticket_id\",\"comment\"]}")
+            };
+
+            var setPriorityTool = new FunctionToolDefinition("set_ticket_priority")
+            {
+                Description = "Set ticket priority (1=high,5=low)",
+                Parameters = BinaryData.FromString("{\"type\":\"object\",\"properties\":{\"ticket_id\":{\"type\":\"string\"},\"priority\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":5}},\"required\":[\"ticket_id\",\"priority\"]}")
+            };
+
+            var escalateTool = new FunctionToolDefinition("escalate_ticket")
+            {
+                Description = "Escalate a ticket with a reason",
+                Parameters = BinaryData.FromString("{\"type\":\"object\",\"properties\":{\"ticket_id\":{\"type\":\"string\"},\"reason\":{\"type\":\"string\"}},\"required\":[\"ticket_id\",\"reason\"]}")
+            };
+
+            var listTicketsTool = new FunctionToolDefinition("list_user_tickets")
+            {
+                Description = "List recent tickets for a user",
+                Parameters = BinaryData.FromString("{\"type\":\"object\",\"properties\":{\"email_address\":{\"type\":\"string\"}},\"required\":[\"email_address\"]}")
+            };
+
+            var searchKbTool = new FunctionToolDefinition("search_kb")
+            {
+                Description = "Search internal KB for answers",
+                Parameters = BinaryData.FromString("{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}")
+            };
+
+            var sendEmailTool = new FunctionToolDefinition("send_email_notification")
+            {
+                Description = "Send an email notification (demo)",
+                Parameters = BinaryData.FromString("{\"type\":\"object\",\"properties\":{\"to\":{\"type\":\"string\"},\"subject\":{\"type\":\"string\"},\"body\":{\"type\":\"string\"}},\"required\":[\"to\",\"subject\",\"body\"]}")
+            };
+
             // Create the assistant with tools
             var assistantOptions = new AssistantCreationOptions()
             {
                 Name = "support-agent",
                 Instructions = """
                         You are a technical support agent.
-                        When a user has a technical issue, you get their email address and a description of the issue.
-                        Then you use those values to submit a support ticket using the function available to you.
-                        If a file is saved, tell the user the file name.
-                    """,
+
+                        Workflow:
+                        1) If a user reports an issue, collect a valid email and a short description, then call submit_support_ticket.
+                        2) If a user asks about a ticket, call check_ticket_status.
+                        3) If a user wants to add details, call add_ticket_comment.
+                        4) For urgency, call set_ticket_priority (1..5) and optionally escalate_ticket with a reason.
+                        5) If a user asks what tickets they have, call list_user_tickets with their email.
+                        6) If the user asks how to fix something, try search_kb; summarize top 1–3 hits.
+                        7) If the user asks to notify someone, call send_email_notification.
+
+                        Rules:
+                        - Confirm critical fields back to the user before calling a tool.
+                        - Never invent ticket IDs. Ask for them if missing.
+                        - Only escalate with a clear reason.
+                        """,
                 Tools = { submitTicketTool }
             };
+
+            assistantOptions.Tools.Add(checkStatusTool);
+            assistantOptions.Tools.Add(addCommentTool);
+            assistantOptions.Tools.Add(setPriorityTool);
+            assistantOptions.Tools.Add(escalateTool);
+            assistantOptions.Tools.Add(listTicketsTool);
+            assistantOptions.Tools.Add(searchKbTool);
+            assistantOptions.Tools.Add(sendEmailTool);
 
             var assistant = await assistantClient.CreateAssistantAsync(
                 model: modelDeployment,
@@ -141,22 +189,44 @@ class Program
 
                             foreach (var toolCall in requiredActions)
                             {
-                                if (toolCall.FunctionName == "submit_support_ticket")
+                                try
                                 {
-                                    try
-                                    {
-                                        var arguments = JsonSerializer.Deserialize<Dictionary<string, string>>(toolCall.FunctionArguments);
-                                        var result = UserFunctions.SubmitSupportTicket(
-                                            arguments["email_address"],
-                                            arguments["description"]
-                                        );
+                                    var args = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(toolCall.FunctionArguments);
 
-                                        toolOutputs.Add(new ToolOutput(toolCall.ToolCallId, result));
-                                    }
-                                    catch (Exception ex)
+                                    string result = toolCall.FunctionName switch
                                     {
-                                        toolOutputs.Add(new ToolOutput(toolCall.ToolCallId, $"Error: {ex.Message}"));
-                                    }
+                                        "submit_support_ticket" => UserFunctions.SubmitSupportTicket(
+                                            args["email_address"].GetString()!, args["description"].GetString()!),
+
+                                        "check_ticket_status" => UserFunctions.CheckTicketStatus(
+                                            args["ticket_id"].GetString()!),
+
+                                        "add_ticket_comment" => UserFunctions.AddTicketComment(
+                                            args["ticket_id"].GetString()!, args["comment"].GetString()!),
+
+                                        "set_ticket_priority" => UserFunctions.SetTicketPriority(
+                                            args["ticket_id"].GetString()!, args["priority"].GetInt32()),
+
+                                        "escalate_ticket" => UserFunctions.EscalateTicket(
+                                            args["ticket_id"].GetString()!, args["reason"].GetString()!),
+
+                                        "list_user_tickets" => UserFunctions.ListUserTickets(
+                                            args["email_address"].GetString()!),
+
+                                        "search_kb" => UserFunctions.SearchKb(
+                                            args["query"].GetString()!),
+
+                                        "send_email_notification" => UserFunctions.SendEmailNotification(
+                                            args["to"].GetString()!, args["subject"].GetString()!, args["body"].GetString()!),
+
+                                        _ => JsonSerializer.Serialize(new { error = $"Unknown tool: {toolCall.FunctionName}" })
+                                    };
+
+                                    toolOutputs.Add(new ToolOutput(toolCall.ToolCallId, result));
+                                }
+                                catch (Exception ex)
+                                {
+                                    toolOutputs.Add(new ToolOutput(toolCall.ToolCallId, $"Error: {ex.Message}"));
                                 }
                             }
 
