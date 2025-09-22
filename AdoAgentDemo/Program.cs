@@ -43,27 +43,6 @@ class Program
 
         try
         {
-            // Define the function tool
-            var submitTicketTool = new FunctionToolDefinition("submit_support_ticket");
-            submitTicketTool.Description = "Submit a support ticket with email and description";
-            submitTicketTool.Parameters = BinaryData.FromString("""
-                {
-                    "type": "object",
-                    "properties": {
-                        "email_address": {
-                            "type": "string",
-                            "description": "The email address of the user"
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Description of the issue"
-                        }
-                    },
-                    "required": ["email_address", "description"]
-                }
-                """);
-
-
             var getBuildDefinitionsTool = new FunctionToolDefinition("get_build_definitions");
             getBuildDefinitionsTool.Description = "List build (YAML) pipeline definitions in an Azure DevOps project.";
             getBuildDefinitionsTool.Parameters = BinaryData.FromString("""
